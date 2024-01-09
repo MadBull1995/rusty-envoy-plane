@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  envoy:
+    image: envoyproxy/envoy:v1.27-latest
+    volumes:
+      - ./envoy/config.yaml:/etc/envoy/envoy.yaml
+    ports:
+      - "9901:9901"
+    networks:
+      - xds_network
+
+networks:
+  xds_network:
+    driver: bridge

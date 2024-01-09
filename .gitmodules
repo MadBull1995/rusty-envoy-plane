@@ -1,0 +1,21 @@
+[submodule "api/envoy"]
+	path = api/envoy
+	url = https://github.com/envoyproxy/envoy.git
+[submodule "api/protoc-gen-validate"]
+	path = api/protoc-gen-validate
+	url = https://github.com/bufbuild/protoc-gen-validate
+[submodule "api/googleapis"]
+	path = api/googleapis
+	url = https://github.com/googleapis/googleapis.git
+[submodule "api/xds"]
+	path = api/xds
+	url = https://github.com/cncf/xds.git
+[submodule "api/opencensus-proto"]
+	path = api/opencensus-proto
+	url = https://github.com/census-instrumentation/opencensus-proto.git
+[submodule "api/opentelemetry-proto"]
+	path = api/opentelemetry-proto
+	url = https://github.com/open-telemetry/opentelemetry-proto.git
+[submodule "api/client_model"]
+	path = api/client_model
+	url = https://github.com/prometheus/client_model.git
