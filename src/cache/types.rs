@@ -15,3 +15,12 @@ pub struct ResourceWithTTL {
     pub resource: ResourceType,
     pub ttl: Option<Duration>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeId(String);
+
+impl NodeId {
+    pub fn new(hashed_id: String) -> Self {
+        Self(hashed_id)
+    }
+}

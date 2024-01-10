@@ -6,6 +6,7 @@ use std::{
     sync::{Arc},
     time::Instant,
 };
+use futures::Future;
 use tokio::sync::{mpsc, Mutex, watch};
 
 use crate::{
@@ -21,7 +22,7 @@ use super::{
     resources::{new_resources, ResourceType, Resources},
     simple::{ResourceSnapshot, SnapshotCache},
     status::StatusInfo,
-    types::{Resource, ResourceWithTTL},
+    types::{Resource, ResourceWithTTL, NodeId},
     Cache, ConfigFetcher, ConfigWatcher, NodeHash, RawResponse, Request, Response, WatchId, WatchResponder, DeltaRequest,
 };
 
@@ -43,6 +44,42 @@ pub struct SnapshotCacheXds<T: NodeHash> {
     ads: bool,
     node_hash: T,
     inner: Arc<Mutex<Inner>>,
+    control_plane_id: &'static str,
+}
+
+impl<T: NodeHash> SnapshotCacheXds<T> {
+
+    async fn respond_watch(&self, to_delete: &mut Vec<u64>, snapshot: &Snapshot, watch: &Watch, id: u64) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        let ver = snapshot.get_version(&watch.req.type_url);
+        if ver != watch.req.version_info {
+            println!(
+                "respond open watch {} {}{:?} with new version {}",
+                id,
+                watch.req.type_url,
+                watch.req.resource_names,
+                ver
+            );
+            let resources = snapshot.get_resources(&watch.req.type_url);
+
+            self.respond(&watch.req, watch.tx.clone(), &resources, &ver, false).await?;
+            to_delete.push(id);
+
+        }
+        Ok(())
+    }
+
+    pub async fn respond_sotw_watches(&self, status: &mut StatusInfo, snapshot: &Snapshot) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        let mut to_delete = Vec::new();
+
+        for (key, watch) in &status.watches {
+            self.respond_watch(&mut to_delete, snapshot, &watch, *key).await?;
+        }
+        for watch_id in &to_delete {
+            status.watches.remove(watch_id).unwrap();
+        }
+        
+        Ok(())
+    }
 }
 
 impl<T: NodeHash> SnapshotCache for SnapshotCacheXds<T> {
@@ -53,31 +90,10 @@ impl<T: NodeHash> SnapshotCache for SnapshotCacheXds<T> {
     ) -> Result<(), Box<dyn std::error::Error  + Send + Sync + 'static>> {
         let mut inner = self.inner.lock().await;
         
-        if let Some(status) = inner.status.get_mut(node) {
-            let mut to_delete = Vec::new();
-            println!("setting snapshot watches_count={:?}", status.get_num_watches());
-            for (watch_id, watch) in &status.watches {
-                let ver = snapshot.get_version(&watch.req.type_url);
-                println!("snapshot_version = {} watch_req_version = {:?}", ver, watch.req.version_info);
-                if ver != watch.req.version_info {
-                    to_delete.push(*watch_id)
-                }
-            }
-    
-            // Second loop: remove the watches
-            for watch_id in &to_delete {
-                let watch = status.watches.remove(&watch_id).unwrap();
-                // let res_type = get_response_type(&watch.req.type_url);
-                let rsc = snapshot.get_resources(&watch.req.type_url);
-                let ver = snapshot.get_version(&watch.req.type_url);
-                println!(
-                    "watch triggered version={} type_url={}",
-                    ver,
-                    &watch.req.type_url
-                );
-                // get_resource_references(&rsc.unwrap().items, &mut out);
-                self.respond(&watch.req, watch.tx, &rsc, &ver, false).await?;
-            }
+        if let Some(status) = inner.status.get_mut(&NodeId::new(node.to_owned())) {
+            
+            // Respond to SOTW watches for the node.
+            self.respond_sotw_watches(status, &snapshot).await?;
 
             // let mut to_delete = Vec::new();
             // for (watch_id, watch) in &status.delta_watches {
@@ -120,13 +136,32 @@ impl<T: NodeHash> SnapshotCache for SnapshotCacheXds<T> {
     }
 }
 
+fn check_ads_consistency(req: &Request, resources: Option<Resources>) -> bool {
+    if !req.resource_names.is_empty() {
+        if let Some(resources) = resources {
+            let set: HashSet<&String> = HashSet::from_iter(req.resource_names.iter());
+            for (name, _) in resources.items.iter() {
+                if !set.contains(name) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 impl<T: NodeHash> ConfigWatcher for SnapshotCacheXds<T> {
     async fn create_delta_watch(
         &self,
         request: &super::DeltaRequest,
         response_channel: tokio::sync::mpsc::Sender<super::DeltaResponse>,
     ) -> Option<WatchId> {
-        Some(WatchId { node_id: "request.node".to_string(), index: 1 })
+        if let Some(node) = &request.node {
+            let node_id = node.get_id();
+            Some(WatchId { node_id:NodeId::new(node_id), index: 1 })
+        } else {
+            None
+        }
     }
 
     async fn create_watch(
@@ -139,62 +174,78 @@ impl<T: NodeHash> ConfigWatcher for SnapshotCacheXds<T> {
             let node_id = &n.get_id();
             let mut inner = self.inner.lock().await;
             inner.update_node_status(n.clone());
-            let mut ss = stream_state.lock().await;
-            if let Some(info) = inner.status.get_mut(node_id) {
-                info.last_watch_request_time = Instant::now();
-            } else {
-                inner
-                    .status
-                    .insert(node_id.to_string(), StatusInfo::new(n.clone()));
-            }
-            // let info = inner.status.get_mut(node_id).unwrap();
+
+            let ss = stream_state.lock().await;
 
             if let Some(snapshot) = inner.snapshots.get(node_id) {
                 let version = snapshot.get_version(&request.type_url);
-                println!("{}", version);
-                if let Some(known_resources_names) =
-                    ss.get_known_resource_names(&request.type_url)
-                {
-                    let mut diff: Vec<String> = Vec::with_capacity(known_resources_names.len());
-                    let resources_names: Vec<String> = request.resource_names.clone();
-                    for r in resources_names {
-                        if known_resources_names.contains(&r) {
-                            diff.push(r);
-                        }
-                    }
+                let resources = snapshot.get_resources(&request.type_url);
+                println!("resources {} {}", &request.type_url, resources.clone().unwrap().items.len());
+                let type_known_resource_names = ss.get_known_resource_names(&request.type_url);
 
-                    println!(
-                        "node-id: {} requested {}{:?} and known {:?}. Diff {:?}",
-                        node_id,
-                        request.type_url,
-                        request.resource_names,
-                        known_resources_names.clone(),
-                        diff
-                    );
-
-                    if diff.len() > 0 {
-                        let resources = snapshot.get_resources(&request.type_url);
-                        let _ = self.respond(
-                            &request,
-                            response_channel.clone(),
-                            &resources,
-                            &version,
-                            false,
-                        );
-                        // for name in diff {
-                        // }
+                if inner.is_requesting_new_resources(request, resources.clone(), type_known_resource_names) {
+                    if self.ads && check_ads_consistency(request, resources.clone()) {
+                        println!("not responding: ads consistency");
+                        inner.watch_count += 1;
+                        let watch_id = inner.watch_count.clone();
+                        return Some(inner.set_watch(watch_id, &node_id, request, response_channel));
                     }
-                    return None
-                } else if request.version_info == version {
+                }
+                println!("requested version_info={} current_version={}", &request.version_info, version);
+                if request.version_info == version {
+                    // Client is already at the latest version, so we have nothing to respond with.
+                    // Set a watch because we may receive a new version in the future.
                     inner.watch_count += 1;
                     let watch_id = inner.watch_count.clone();
-                    println!("new watch id: {:?} for {}", watch_id, node_id);
+                    println!("open watch {} for {}{:?} from nodeID {}, version {}", watch_id, request.type_url, request.resource_names, node_id, request.version_info);
                     return Some(inner.set_watch(watch_id, &node_id, request, response_channel));
                 } else {
-                    let resources = snapshot.get_resources(&request.type_url.clone());
-                    let _ = self.respond(&request, response_channel, &resources, &version, false);
+                    // The version has changed, so we should respond.
+                    if self.ads && check_ads_consistency(request, resources.clone()) {
+                        println!("not responding: ads consistency");
+                        inner.watch_count += 1;
+                        let watch_id = inner.watch_count.clone();
+                        return Some(inner.set_watch(watch_id, &node_id, request, response_channel));
+                    }
+                    println!("responding: new version");
+                    println!("resources exists: {}", resources.is_some());
+                    self.respond(&request, response_channel, &resources, &version, false).await;
                     return None
                 }
+                // if let Some(known_resources_names) =
+                //     ss.get_known_resource_names(&request.type_url)
+                // {
+                //     dbg!(known_resources_names.clone());
+                //     let mut diff: Vec<String> = Vec::with_capacity(known_resources_names.len());
+                //     let resources_names: Vec<String> = request.resource_names.clone();
+                //     for r in resources_names {
+                //         if known_resources_names.contains(&r) {
+                //             diff.push(r);
+                //         }
+                //     }
+
+                //     println!(
+                //         "node-id: {} requested {}{:?} and known {:?}. Diff {:?}",
+                //         node_id,
+                //         request.type_url,
+                //         request.resource_names,
+                //         known_resources_names.clone(),
+                //         diff
+                //     );
+
+                //     if diff.len() > 0 {
+                //         let _ = self.respond(
+                //             &request,
+                //             response_channel.clone(),
+                //             &resources,
+                //             &version,
+                //             false,
+                //         );
+                //         // for name in diff {
+                //         // }
+                //     }
+                //     return None
+                // } else
             } else {
                 println!("set watch: no snapshot");
                 inner.watch_count += 1;
@@ -235,15 +286,16 @@ impl<T: NodeHash> Cache for SnapshotCacheXds<T> {
     }
 }
 impl<T: NodeHash> SnapshotCacheXds<T> {
-    pub fn new(ads: bool, node_hash: T) -> Self {
+    pub fn new(ads: bool, node_hash: T, id: &'static str) -> Self {
         SnapshotCacheXds {
             ads,
             inner: Arc::new(Mutex::new(Inner::new())),
             node_hash,
+            control_plane_id: id
         }
     }
 
-    pub async fn node_status(&self) -> HashMap<String, Instant> {
+    pub async fn node_status(&self) -> HashMap<NodeId, Instant> {
         let inner = self.inner.lock().await;
         inner
             .status
@@ -292,23 +344,12 @@ impl<T: NodeHash> SnapshotCacheXds<T> {
         version: &str,
         heartbeat: bool,
     ) -> Result<(), Box<dyn Error  + Send + Sync + 'static>> {
-        if req.resource_names.len() != 0 && self.ads {
-            // match superset(name_set(req.resource_names.clone()), resources.unwrap().items) {
-            //     Err(e) => {
-            //         let res_names = req.resource_names.clone();
-            //         return Err(format!(
-            //             "ADS mode: not responding to request {} {:?}: {:?}",
-            //             req.type_url, res_names, e
-            //         )
-            //         .into());
-            //     }
-            //     Ok(_) => todo!(),
-            // }
-        }
-
-        let response = build_response(&req, resources, version);
-        chan.send((req.clone(), response.clone())).await;
-        dbg!(response);
+        println!("is resources exists: {}", resources.is_some());
+        println!("respond with resources: {:?}", resources);
+        let response = build_response(&req, resources, version, self.control_plane_id);
+        println!("{:?}", response);
+        chan.send((req.clone(), response.clone())).await?;
+        println!("responded node_id={:?} type_url={}", req.node.clone().unwrap().get_id(), &req.type_url);
 
         Ok(())
     }
@@ -318,8 +359,10 @@ fn build_response(
     req: &Request,
     resources: &Option<Resources>,
     version: &str,
+    control_plane_id: &str,
 ) -> Response {
     let mut filtered_resources = Vec::new();
+    println!("building response...");
     if let Some(resources) = resources {
         if req.resource_names.is_empty() {
             filtered_resources = resources
@@ -340,7 +383,9 @@ fn build_response(
         nonce: String::new(),
         version_info: version.to_string(),
         resources: filtered_resources,
-        control_plane: None,
+        control_plane: Some(corePb::ControlPlane {
+            identifier: control_plane_id.to_string()
+        }),
         canary: false,
     }
 }
@@ -379,7 +424,7 @@ fn crate_response(
 #[derive(Debug)]
 struct Inner {
     snapshots: HashMap<String, Snapshot>,
-    status: HashMap<String, StatusInfo>,
+    status: HashMap<NodeId, StatusInfo>,
     watch_count: u64,
     delta_watch_count: u64,
 }
@@ -399,19 +444,44 @@ impl Inner {
             req: req.clone(),
             tx,
         };
-        let status = self.status.get_mut(node_id).unwrap();
+        let id = NodeId::new(node_id.to_owned());
+        let status = self.status.get_mut(&id).unwrap();
         status.watches.insert(watch_id, watch);
         WatchId {
-            node_id: node_id.to_string(),
+            node_id: id,
             index: watch_id,
         }
     }
 
     fn update_node_status(&mut self, node: corePb::Node) {
         self.status
-            .entry(node.id.to_string())
+            .entry(NodeId::new(node.get_id()))
             .and_modify(|entry| entry.last_watch_request_time = Instant::now())
             .or_insert_with(|| StatusInfo::new(node));
+    }
+
+    fn is_requesting_new_resources(
+        &self,
+        req: &Request,
+        resources: Option<Resources>,
+        type_known_resource_names: Option<HashSet<String>>,
+    ) -> bool {
+        if let Some(ref resources) = resources {
+            if let Some(known_resource_names) = type_known_resource_names {
+                let mut diff = Vec::new();
+                for name in &req.resource_names {
+                    if !known_resource_names.contains(name) {
+                        diff.push(name)
+                    }
+                }
+                for name in diff {
+                    if resources.items.contains_key(name) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 }
 
@@ -507,6 +577,7 @@ impl Snapshot {
         // ...
         true // Placeholder
     }
+
 }
 
 fn superset(

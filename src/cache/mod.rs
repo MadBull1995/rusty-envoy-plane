@@ -22,7 +22,7 @@ pub mod types;
 use self::{
     resource::get_resource_name,
     resources::ResourceType,
-    types::{MarsheledResource, Resource, ResourceWithTTL},
+    types::{MarsheledResource, Resource, ResourceWithTTL, NodeId},
 };
 use prost_types::{Any as pbAny, Duration};
 use tokio::sync::mpsc;
@@ -55,7 +55,7 @@ impl NodeHash for core::Node {
 
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord)]
 pub struct WatchId {
-    pub node_id: String,
+    pub node_id: NodeId,
     pub index: u64,
 }
 

@@ -94,23 +94,6 @@ impl Resource for route::ScopedRouteConfiguration {}
 impl Resource for core::TypedExtensionConfig {}
 impl Resource for discovery::v3::Resource {}
 
-impl ResourceType {
-	pub fn get_raw(&self) -> &dyn Resource {
-		match self {
-			ResourceType::Cluster(c) => c as &dyn Resource,
-			ResourceType::Endpoint(_) => todo!(),
-			ResourceType::Route(_) => todo!(),
-			ResourceType::Listener(_) => todo!(),
-			ResourceType::Secret(_) => todo!(),
-			ResourceType::Runtime(_) => todo!(),
-			ResourceType::ScopedRoute(_) => todo!(),
-			ResourceType::ExtensionConfig(_) => todo!(),
-			ResourceType::Unknown => todo!(),
-    		ResourceType::Resource(_) => todo!(),
-		}
-	}
-}
-
 /// Resources is a versioned group of resources.
 #[derive(Debug, Clone)]
 pub struct Resources {

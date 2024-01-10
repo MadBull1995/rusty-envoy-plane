@@ -80,11 +80,14 @@ pub async fn handle_stream<C: Cache>(
             maybe_req = requests.next() => {
                 // TODO: Fix btorkn h2 pipe double unwrap()
                 let req = maybe_req.unwrap().unwrap();
-                println!("ERROR: {:?}", req.error_detail);
+                if let Some(err) = &req.error_detail {
+                    println!("ERROR: {:?}", err);
+                }
                 stream.build_client_request_span(&req);
                 stream.handle_client_request(req).await;
             }
             Some(rep) = stream.watches_rx.recv() => {
+                println!("recieved response: {:?}", rep.0.type_url);
                 stream.handle_watch_response(rep).await;
             }
         }
@@ -97,7 +100,7 @@ impl<C: Cache> Stream<C> {
         type_url: &'static str,
         cache: Arc<C>,
     ) -> Self {
-        let (watches_tx, watches_rx) = mpsc::channel(16);
+        let (watches_tx, watches_rx) = mpsc::channel(32);
         let cache_clone = cache.clone();
         Self {
             handle: Arc::new(Mutex::new(StreamState::new(false, None))),

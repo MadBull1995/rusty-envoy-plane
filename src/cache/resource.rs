@@ -41,11 +41,10 @@ impl ResponseType {
             3 => ResponseType::Route,
             4 => ResponseType::ScopedRoute,
             5 => ResponseType::VirtualHost,
-            6 => ResponseType::Listener,
-            7 => ResponseType::Secret,
-            8 => ResponseType::Runtime,
-            9 => ResponseType::ExtensionConfig,
-            10 => ResponseType::RateLimitConfig,
+            6 => ResponseType::Secret,
+            7 => ResponseType::Runtime,
+            8 => ResponseType::ExtensionConfig,
+            9 => ResponseType::RateLimitConfig,
             _ => ResponseType::UnknownType,
         }
     }
@@ -115,7 +114,7 @@ pub fn get_all_resource_references<'a>(resource_groups: &'a HashMap<ResponseType
     ret
 }
 
-fn get_listenet_references(src: &listener::Listener, out: &mut HashMap<ResponseType, HashMap<String, bool>> ) {
+fn get_listener_references(src: &listener::Listener, out: &mut HashMap<ResponseType, HashMap<String, bool>> ) {
     let mut routes = HashMap::new();
     
     for chain in &src.filter_chains {

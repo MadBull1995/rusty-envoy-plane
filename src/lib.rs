@@ -2,22 +2,47 @@ include!(concat!(env!("OUT_DIR"), "/mod.rs"));
 pub mod cache;
 // pub mod api;
 pub mod resource;
-pub mod well_knowns;
 pub mod server;
 pub mod types;
+pub mod well_knowns;
 
-use envoy::config::endpoint::v3::Endpoint as EndpointPb;
-use envoy::config::listener;
-use envoy::config::listener::v3::{Listener as ListenerPb, Filter as FilterPb, filter};
+use cache::resource::ResponseType;
+use cache::resources::ResourceType;
+use cache::{
+    snapshot::SnapshotCacheXds
+};
+use envoy::config::core::v3::{address, socket_address::PortSpecifier, Address, SocketAddress};
 use envoy::extensions::filters::network::http_connection_manager::v3 as hcm;
-use envoy::config::core::v3::{address, Address, SocketAddress, socket_address::PortSpecifier};
-use prost::Message;
+use envoy::{
+    // Config resources
+    config::{
+        cluster,
+        endpoint::v3::Endpoint as EndpointPb,
+        listener,
+        listener::v3::{filter, Filter as FilterPb, Listener as ListenerPb},
+    },
+    service::cluster::v3::cluster_discovery_service_server::ClusterDiscoveryServiceServer,
+    // xDS services
+    service::listener::v3::listener_discovery_service_server::ListenerDiscoveryServiceServer,
+    service::route::v3::route_discovery_service_server::RouteDiscoveryServiceServer,
+};
+use futures::FutureExt;
 use google::protobuf::Any;
+use prost::Message;
 use resource::HCM_TYPE;
+use server::service::Service;
+use std::collections::HashMap;
+use std::error::Error;
+use std::sync::Arc;
+use tokio::sync::oneshot;
+use tonic::transport::Server;
 use types::config::cluster::Cluster;
-use types::config::listener::{Listener, Filter, ListenerFilterType, FilterChain};
+use types::config::endpoint::Endpoint;
+use types::config::listener::{Filter, FilterChain, Listener, ListenerFilterType};
 use types::extensions::filters::network::HttpConnectionManager;
 pub const ANY_PREFIX: &str = "type.googleapis.com";
+
+pub use cache::{snapshot::Snapshot, simple::SnapshotCache};
 
 pub fn run(left: usize, right: usize) -> usize {
     left + right
@@ -37,7 +62,7 @@ impl ListenerBuilder {
             name: name.to_owned(),
             addr: None,
             filter_chain: None,
-            port: None
+            port: None,
         }
     }
 
@@ -51,6 +76,11 @@ impl ListenerBuilder {
         self
     }
 
+    pub fn port(&mut self, port: u32) -> &mut Self {
+        self.port = Some(port);
+        self
+    }
+
     pub fn build(&self) -> Listener {
         let filter_chain = {
             if let Some(filter_chain) = self.filter_chain.clone() {
@@ -59,14 +89,13 @@ impl ListenerBuilder {
                 panic!("must pass valid filter_chain to listener")
             }
         };
-        Listener { 
+        Listener {
             name: self.name.clone(),
             addr: self.addr.clone().unwrap_or("0.0.0.0".to_string()),
             port: self.port.unwrap_or(5678),
-            filter_chain: filter_chain
+            filter_chain: filter_chain,
         }
     }
-
 }
 
 #[derive(Clone, Debug)]
@@ -97,12 +126,11 @@ impl ListenerFilterChainBuilder {
     }
 }
 
-
 /// Generate a filter chain wraps a set of match criteria, an option TLS context, a set of filters, and various other parameters.
 #[derive(Clone, Debug)]
 pub struct ListenerFilterBuilder {
     name: String,
-    config_type: Option<ListenerFilterType>
+    config_type: Option<ListenerFilterType>,
 }
 
 impl ListenerFilterBuilder {
@@ -115,7 +143,7 @@ impl ListenerFilterBuilder {
 
     pub fn http_connection_manager(&mut self, hcm: HttpConnectionManager) -> &mut Self {
         self.config_type = Some(ListenerFilterType::HttpConnectionManager(hcm));
-        
+
         self
     }
 
@@ -127,9 +155,9 @@ impl ListenerFilterBuilder {
                 panic!("canot build listener filter without valid Any data");
             }
         };
-        Filter { 
+        Filter {
             name: self.name.clone(),
-            config_type: cfg
+            config_type: cfg,
         }
     }
 }
@@ -138,6 +166,9 @@ impl ListenerFilterBuilder {
 pub struct ClusterBuilder {
     name: String,
     hidden: bool,
+    endpoints: Vec<Endpoint>,
+    r#type: cluster::v3::cluster::DiscoveryType,
+    lb_policy: cluster::v3::cluster::LbPolicy,
 }
 
 impl ClusterBuilder {
@@ -145,6 +176,9 @@ impl ClusterBuilder {
         Self {
             name: name.to_owned(),
             hidden: false,
+            endpoints: Vec::new(),
+            lb_policy: cluster::v3::cluster::LbPolicy::RoundRobin,
+            r#type: cluster::v3::cluster::DiscoveryType::StrictDns,
         }
     }
 
@@ -154,128 +188,115 @@ impl ClusterBuilder {
         self
     }
 
+    pub fn add_endpoint(&mut self, endpoint: Endpoint) -> &mut Self {
+        self.endpoints.push(endpoint);
+
+        self
+    }
+
     pub fn build(&self) -> Cluster {
-        Cluster { 
+        Cluster {
             name: self.name.clone(),
-            endpoints: Vec::new(),
+            endpoints: self.endpoints.clone(),
             hidden: false,
+            lb_policy: self.lb_policy,
+            r#type: self.r#type,
         }
     }
 }
-// pub struct Listener {
-//     pub name: String,
-//     pub addr: String,
-//     pub port: u32,
-//     pub filters: Vec<Filter>
-// }
 
-// #[derive(Clone, Debug)]
-// pub struct Route {
-//     pub name: String,
+/// The main control plane data
+pub struct EnvoyControlPlane {
+    addr: &'static str,
+    pub cache: Arc<SnapshotCacheXds<cache::IDHash>>,
+    pub shutdown: Option<oneshot::Sender<()>>,
+    snapshot_version: u64,
+}
 
-// }
+impl EnvoyControlPlane {
+    pub fn new(identifier: &'static str, addr: &'static str) -> Self {
+        let cache = Arc::new(SnapshotCacheXds::new(false, cache::IDHash, &identifier));
 
-// #[derive(Clone, Debug)]
-// pub struct Cluster {
-//     pub name: String,
-//     pub endpoints: Vec<Endpoint>,
-//     pub hidden: bool,
-// }
+        Self {
+            addr: addr,
+            cache,
+            shutdown: None,
+            snapshot_version: 0
+        }
+    }
 
-// #[derive(Clone, Debug)]
-// pub struct Endpoint {
-//     pub addr: String,
-//     pub port: u32,
-// }
+    fn new_snapshot_version(&mut self) -> String {
+        self.snapshot_version+=1;
+        format!("{}", self.snapshot_version)
+    }
 
-// #[derive(Clone, Debug, PartialEq)]
+    pub async fn run(&mut self) {
+        self.serve_with_shutdown().await;
+    }
 
-// pub enum TypedConfig {
-//     HttpConnectionManager(hcm::HttpConnectionManager),
-// }
+    pub fn new_snapshot(
+        &mut self,
+        resources: HashMap<ResponseType, Vec<ResourceType>>
+    ) -> Result<Snapshot, Box<dyn Error + Send + Sync + 'static>> {
+        let ver = self.new_snapshot_version();
+        let snapshot = Snapshot::new(ver, resources)?;
+        Ok(snapshot)
+    }
 
-// impl TypedConfig {
-//     pub fn into_any(&self) -> Any {
-//        match self {
-//         TypedConfig::HttpConnectionManager(hcm) => {
-//             Any {
-//                 type_url: HCM_TYPE.to_string(),
-//                 value: hcm.encode_to_vec()
-//             }
-//         }
-//        }
-//     }
-// }
+    async fn serve_with_shutdown(&mut self) {
+        let (tx, rx) = oneshot::channel::<()>();
+        let addr = self.addr.parse().unwrap();
 
-// #[derive(Clone, Debug)]
-// pub struct Filter {
-//     pub name: String,
-//     pub typed: TypedConfig,
-// }
+        let lds_service = Service::new(self.cache.clone());
+        let cds_service = Service::new(self.cache.clone());
+        let rds_service = Service::new(self.cache.clone());
 
-// impl Listener {
-//     pub fn to_proto(&self) -> ListenerPb {
-//         ListenerPb {
-//             name: self.name.clone(),
-//             address: Some(Address {
-//                 address: Some(address::Address::SocketAddress(
-//                     SocketAddress {
-//                         address: self.addr.clone(),
-//                         port_specifier: Some(PortSpecifier::PortValue(self.port)),
-//                         ..Default::default()
-//                     }
-//                 ))
-//             }),
-//             filter_chains: self.filters_to_proto(),
-//             ..Default::default()
-//         }
-//     }
+        let lds = ListenerDiscoveryServiceServer::new(lds_service);
+        let cds = ClusterDiscoveryServiceServer::new(cds_service);
+        let rds = RouteDiscoveryServiceServer::new(rds_service);
 
-//     fn filters_to_proto(&self) -> Vec<FilterChain> {
-//         let mut filters = Vec::with_capacity(self.filters.len());
-//         for filter in &self.filters {
-//             filters.push(FilterPb {
-//                 name: filter.name.clone(),
-//                 config_type: Some(filter::ConfigType::TypedConfig(
-//                     filter.typed.into_any()
-//                 ))
-//             })
-//         }
+        let server = Server::builder()
+            .add_service(lds)
+            .add_service(cds)
+            .add_service(rds);
 
-//         vec![FilterChain {
-//             filters,
-//             ..Default::default()
-//         }]
-//     }
-// }
+        // tokio::spawn(server.serve_with_shutdown(addr, rx.map(drop)));
+        self.shutdown = Some(tx);
+        server.serve(addr).await;
+    }
+}
 
 #[cfg(test)]
 mod tests {
 
-    use crate::{cache::{ConfigWatcher, Request}, server::stream::StreamState};
+    use crate::{
+        cache::{ConfigWatcher, Request},
+        server::stream::StreamState,
+    };
 
     use super::*;
     use tokio;
     #[tokio::test]
 
     async fn it_works() {
-        let snapshot = cache::snapshot::SnapshotCacheXds::new(false, cache::IDHash);
+        let snapshot =
+            cache::snapshot::SnapshotCacheXds::new(false, cache::IDHash, "my_control_plane");
         // dbg!(snapshot);
         let req = Request {
             node: Some(envoy::config::core::v3::Node {
-               id: "some_node".to_string(),
-               cluster: "cluster_name".to_string(),
-               ..Default::default() 
+                id: "some_node".to_string(),
+                cluster: "cluster_name".to_string(),
+                ..Default::default()
             }),
             ..Default::default()
         };
-        
+
         // let (tx, rx) = tokio::sync::mpsc::channel(4);
         // let ss = StreamState::new(false, None);
         // let f = snapshot.create_watch(&req, &ss, tx).await;
         // let ns = snapshot.node_status().await;
         // dbg!(f);
-        
+
         ()
     }
 }

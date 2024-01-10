@@ -1,7 +1,8 @@
 use crate::types::extensions::filters::network::HttpConnectionManager;
 use crate::google::protobuf::{Any, BoolValue};
 use crate::envoy::{
-    config::{route::v3 as routePb, listener::v3 as listenerPb, core::v3 as corePb},
+    config::{route::v3 as routePb, listener::v3 as listenerPb, core::v3 as corePb, endpoint::v3 as endpointPb},
+
 };
 
 use prost::Message;
@@ -16,12 +17,23 @@ pub mod cluster {
         pub name: String,
         pub endpoints: Vec<endpoint::Endpoint>,
         pub hidden: bool,
+        pub r#type: cluster::v3::cluster::DiscoveryType,
+        pub lb_policy: cluster::v3::cluster::LbPolicy,
     }
 
     impl Into<cluster::v3::Cluster> for Cluster {
         fn into(self) -> cluster::v3::Cluster {
             cluster::v3::Cluster {
                 name: self.name.clone(),
+                load_assignment: Some(endpointPb::ClusterLoadAssignment {
+                    cluster_name: self.name.clone(),
+                    endpoints: self.endpoints.into_iter().map(|e| Into::<endpointPb::LocalityLbEndpoints>::into(e)).collect(),
+                    ..Default::default()
+                }),
+                cluster_discovery_type: Some(cluster::v3::cluster::ClusterDiscoveryType::r#Type(
+                    self.r#type.into()
+                )),
+                lb_policy: self.lb_policy.into(),
                 ..Default::default()
             }
         }
@@ -33,10 +45,21 @@ pub mod core {
 }
 
 pub mod endpoint {
+    use super::*;
+
     #[derive(Debug, Clone)]
     pub struct Endpoint {
-        pub addr: String,
-        pub port: u32,
+        pub cluster_name: String,
+        pub lb_endpoints: Vec<endpointPb::LbEndpoint>,
+    }
+
+    impl Into<endpointPb::LocalityLbEndpoints> for Endpoint {
+        fn into(self) -> endpointPb::LocalityLbEndpoints {
+            endpointPb::LocalityLbEndpoints {
+                lb_endpoints: self.lb_endpoints,
+                ..Default::default()
+            }
+        }
     }
 }
 

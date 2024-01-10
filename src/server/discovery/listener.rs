@@ -1,8 +1,15 @@
-use crate::cache::{Cache, DeltaResponse as DeltaDiscoveryResponse, Response as DiscoveryResponse, Request as DiscoveryRequest, DeltaRequest as DeltaDiscoveryRequest};
-use crate::envoy::service::listener::v3::listener_discovery_service_server::ListenerDiscoveryService;
-use crate::server::service::{Service, StreamResponse};
-use crate::resource::LISTENER_TYPE;
 use tonic::{Request, Response, Status, Streaming};
+
+use crate::{
+    resource::LISTENER_TYPE,
+    server::service::{Service, StreamResponse},
+    cache::{
+        Cache, DeltaRequest as DeltaDiscoveryRequest, DeltaResponse as DeltaDiscoveryResponse,
+        Request as DiscoveryRequest, Response as DiscoveryResponse,
+    },
+    envoy::service::listener::v3::listener_discovery_service_server::ListenerDiscoveryService,
+};
+
 
 #[tonic::async_trait]
 impl<C: Cache> ListenerDiscoveryService for Service<C> {

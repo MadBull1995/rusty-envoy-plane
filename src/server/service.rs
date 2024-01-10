@@ -55,6 +55,7 @@ impl<C: Cache> Service<C> {
         let output = ReceiverStream::new(rx);
         let cache_clone = self.cache.clone();
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::SeqCst);
+        todo!();
         // tokio::spawn(
         //     async move { handle_delta_stream(input, tx, type_url, cache_clone).await }.instrument(
         //         println!(
